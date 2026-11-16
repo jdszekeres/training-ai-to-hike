@@ -2,8 +2,8 @@
 env/
 .vscode
 __pycache__
-data/
-typings/
+data
+typings
 data/
 MUJOCO_LOG.TXT
 checkpoints/
