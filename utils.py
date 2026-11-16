@@ -1,4 +1,5 @@
 import time
+from mujoco import mujoco
 import requests
 import os
 
@@ -39,14 +40,29 @@ def overpass_query(query, count = 0):
     response.raise_for_status()  # Raise an error for bad responses
     return response.json()
 
-def node_id_to_pixel(node_id):
-    #Use overpass_query to get the node's coordinates
-    query = f"""
-    [out:json];
-    node({node_id});
-    out body;
+
+def import_mujoco_xml_to_spec(spec, xml_string, frame_name="imported_frame"):
     """
-    response = overpass_query(query)
+    Imports a MuJoCo XML string into a Brax environment specification.
+    
+    Parameters:
+    spec: The Brax environment specification object.
+    xml_string: The MuJoCo XML content as a string.
+    
+    Returns:
+    The updated Brax environment specification with the imported XML.
+    """
+    # Assuming spec has a method to import XML, this is a placeholder
+    with mujoco.MjVfs() as vfs:
+        snippet_xml = xml_string.encode('utf-8')
+        vfs["snippet.xml"] = snippet_xml
+        new_spec = mujoco.MjSpec.from_file("snippet.xml", vfs=vfs)
+        frame = spec.worldbody.add_frame(name=frame_name)
+        new_root_body = new_spec.body("pelvis") # Or the actual root body
+        if new_root_body:
+            frame.attach_body(new_root_body)
+        
+    return spec
 
 
 

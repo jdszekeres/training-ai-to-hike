@@ -4,6 +4,7 @@ import math
 import mujoco
 import numpy as np
 import rasterio
+from scipy import ndimage
 from PIL import Image, ImageDraw
 import json
 
@@ -26,6 +27,20 @@ TERRAIN_COLORS = [
     (1.00, (245, 245, 250)),  # snow
 ]
 TRAIL_COLOR = (230, 30, 30)
+
+# --- Ground roughness ---------------------------------------------------------
+# The DEM is far too coarse (~75-90 m cells) to have any human-scale detail, so
+# the heightfield is resampled onto a finer grid and fractal noise is added.
+HFIELD_TARGET_CELL_M = 1.0      # desired heightfield spacing (metres)
+# Cap on nrow*ncol; large areas get coarser cells. Rendering cost scales with
+# this (~0.6 s/frame at 1M on Intel UHD), physics barely notices it.
+HFIELD_MAX_CELLS = 1_000_000
+ROUGHNESS_RMS_AT_1M = 0.03      # RMS bump height (m) of 1 m-wavelength features
+ROUGHNESS_HURST = 0.8           # amplitude grows as wavelength**HURST
+ROUGHNESS_MAX_WAVELENGTH_M = 32.0
+TRAIL_WIDTH_M = 2.0             # trails get much less roughness than open ground
+TRAIL_ROUGHNESS_FACTOR = 0.2
+ROUGHNESS_SEED = 0
 
 
 def fetchOpenTopography(key, lat1, lon1, lat2, lon2, name):
@@ -84,6 +99,36 @@ def getTrails(lat1, lon1, lat2, lon2, cache_file=None):
             json.dump(json_response, f)
     return json_response
 
+def coordinate_to_pixel(lat, lon, terrain_file):
+    """
+    Converts geographic coordinates (latitude, longitude) to pixel coordinates in the terrain image.
+
+    Parameters:
+    lat: Latitude of the point.
+    lon: Longitude of the point.
+    terrain_file: Path to the terrain GeoTIFF file.
+
+    Returns:
+    A tuple (col, row) representing the pixel coordinates in the terrain image.
+    """
+    with rasterio.open(terrain_file) as dataset:
+        # Get the affine transformation for the dataset
+        transform = dataset.transform
+        # Use the inverse of the transform to convert geographic coordinates to pixel coordinates
+        inv_transform = ~transform
+        col, row = inv_transform * (lon, lat)
+        return int(col), int(row)
+
+def pixel_to_world_coordinate(row, col, terrain_file):
+    """
+    Convert pixel coordiantes (row, col) to coordinates in the mujoco world frame (x, y)."""
+    
+    with rasterio.open(terrain_file) as dataset:
+        transform = dataset.transform
+        # Use the transform to convert pixel coordinates to geographic coordinates
+        lon, lat = transform * (col + 0.5, row + 0.5)  # +0.5 to get the center of the pixel
+        return lat, lon
+    
 
 def _trailPolylines(trails_data, inv_transform):
     """Converts OSM ways into lists of fractional (col, row) DEM pixel-centre coordinates."""
@@ -126,7 +171,36 @@ def _hillshade(elev_m, dx_m, dy_m, azimuth_deg=315.0, altitude_deg=45.0):
     return np.clip(shade, 0.0, 1.0)
 
 
-def buildWorldFromElevationData(lat1, lon1, lat2, lon2, name):
+def _hfieldHeight(hfield01, relief, half_x, half_y, x, y):
+    """Bilinearly samples a MuJoCo hfield (row 0 = -y, normalized 0..1) at world (x, y)."""
+    nrow, ncol = hfield01.shape
+    c = np.clip((x + half_x) / (2 * half_x) * (ncol - 1), 0, ncol - 1)
+    r = np.clip((y + half_y) / (2 * half_y) * (nrow - 1), 0, nrow - 1)
+    c0, r0 = int(c), int(r)
+    c1, r1 = min(c0 + 1, ncol - 1), min(r0 + 1, nrow - 1)
+    fc, fr = c - c0, r - r0
+    h = (hfield01[r0, c0] * (1 - fc) * (1 - fr) + hfield01[r0, c1] * fc * (1 - fr)
+         + hfield01[r1, c0] * (1 - fc) * fr + hfield01[r1, c1] * fc * fr)
+    return float(h) * relief
+
+
+def _fractalRoughness(shape, cell_m, rng):
+    """
+    Zero-mean multi-octave noise (metres) on a grid with `cell_m` spacing.
+    Octaves shorter than two cells can't be represented and are skipped.
+    """
+    noise = np.zeros(shape, dtype=np.float32)
+    wavelength = max(1.0, 2.0 * cell_m)
+    while wavelength <= ROUGHNESS_MAX_WAVELENGTH_M:
+        octave = ndimage.gaussian_filter(rng.standard_normal(shape).astype(np.float32),
+                                         sigma=wavelength / (4.0 * cell_m), mode="wrap")
+        octave /= octave.std() + 1e-12
+        noise += octave * (ROUGHNESS_RMS_AT_1M * wavelength ** ROUGHNESS_HURST)
+        wavelength *= 2.0
+    return noise
+
+
+def buildWorldModel(lat1, lon1, lat2, lon2, name, add_person=True):
     """
     Builds a world representation from the elevation data file.
 
@@ -188,8 +262,42 @@ def buildWorldFromElevationData(lat1, lon1, lat2, lon2, name):
                   for dy in (-1, 0, 1) for dx in (-1, 0, 1)) / 9.0
     elevation_m[trail_mask] = blurred[trail_mask]
 
-    # Normalized heights for MuJoCo (0..1, scaled by size[2]).
-    elevation = np.clip((elevation_m - minimum) / relief, 0.0, 1.0)
+    # --- Fine heightfield with roughness -------------------------------------
+    hf_cell_m = max(HFIELD_TARGET_CELL_M, math.sqrt(4 * half_x * half_y / HFIELD_MAX_CELLS))
+    hf_ncol = int(round(2 * half_x / hf_cell_m)) + 1
+    hf_nrow = int(round(2 * half_y / hf_cell_m)) + 1
+    # Bicubic resample; zoom() aligns the first/last samples with the DEM's
+    # first/last pixel centres, so the extent (half_x, half_y) is unchanged.
+    fine_m = ndimage.zoom(elevation_m - minimum, (hf_nrow / nrow, hf_ncol / ncol),
+                          order=3, mode="nearest", grid_mode=False).astype(np.float32)
+    hf_nrow, hf_ncol = fine_m.shape
+
+    # Trails at their real width, feathered, so they stay smoother than open ground.
+    fine_trail_img = Image.new("L", (hf_ncol, hf_nrow), 0)
+    fine_draw = ImageDraw.Draw(fine_trail_img)
+    sx, sy = (hf_ncol - 1) / (ncol - 1), (hf_nrow - 1) / (nrow - 1)
+    trail_px = max(1, int(round(TRAIL_WIDTH_M / hf_cell_m)))
+    for pts in trail_lines:
+        fine_draw.line([(c * sx, r * sy) for c, r in pts], fill=255, width=trail_px)
+    fine_trail = ndimage.gaussian_filter(np.asarray(fine_trail_img, np.float32) / 255.0, sigma=1.0)
+    fine_trail = np.clip(fine_trail / max(fine_trail.max(), 1e-6), 0.0, 1.0)
+
+    rng = np.random.default_rng(ROUGHNESS_SEED)
+    roughness = _fractalRoughness(fine_m.shape, hf_cell_m, rng)
+    fine_m += roughness * (1.0 - (1.0 - TRAIL_ROUGHNESS_FACTOR) * fine_trail)
+    print(f"Heightfield: {hf_ncol} x {hf_nrow} cells at {hf_cell_m:.2f} m, "
+          f"roughness RMS {roughness.std():.2f} m")
+
+    # MuJoCo stores heights normalized to 0..1 and scales them by size[2]; the
+    # geom is offset by hf_lo so z stays "metres above the DEM minimum".
+    hf_lo, hf_hi = float(fine_m.min()), float(fine_m.max())
+    hf_relief = hf_hi - hf_lo
+    # MuJoCo's hfield row 0 is at -y (south), GeoTIFF row 0 is north.
+    hfield01 = np.flipud((fine_m - hf_lo) / hf_relief).astype(np.float32)
+    hfield_name = name + "_hfield.bin"
+    with open(os.path.join("data", hfield_name), "wb") as f:
+        np.array([hf_nrow, hf_ncol], dtype=np.int32).tofile(f)
+        hfield01.tofile(f)
 
     # --- Texture -------------------------------------------------------------
     scale = max(1, TEXTURE_MAX_SIZE // max(ncol, nrow))
@@ -228,7 +336,7 @@ def buildWorldFromElevationData(lat1, lon1, lat2, lon2, name):
         diffuse=[0.8, 0.8, 0.8],
         ambient=[0.35, 0.35, 0.35],
         specular=[0, 0, 0],
-        castshadow=True,
+        castshadow=False,
     )
 
     # Top-down camera high enough that the entire heightfield fits in view.
@@ -243,11 +351,8 @@ def buildWorldFromElevationData(lat1, lon1, lat2, lon2, name):
 
     spec.add_hfield(
         name="terrain",
-        nrow=nrow,
-        ncol=ncol,
-        size=[half_x, half_y, relief, max(relief * 0.05, 1.0)],
-        # MuJoCo's hfield row 0 is at -y (south), GeoTIFF row 0 is north.
-        userdata=np.flipud(elevation).flatten().tolist(),
+        file=hfield_name,  # binary: int32 nrow, int32 ncol, float32[nrow*ncol]
+        size=[half_x, half_y, hf_relief, max(hf_relief * 0.05, 1.0)],
     )
 
     spec.add_texture(
@@ -270,17 +375,84 @@ def buildWorldFromElevationData(lat1, lon1, lat2, lon2, name):
     terrain_geom.type = mujoco.mjtGeom.mjGEOM_HFIELD
     terrain_geom.hfieldname = "terrain"
     terrain_geom.material = "terrain_material"
+    terrain_geom.pos = np.array([0, 0, hf_lo], dtype=np.float64)
 
     # Rendering settings for a scene that is kilometres across.
-    spec.stat.center = [0, 0, relief / 2]
+    spec.stat.center = np.array([0, 0, relief / 2], dtype=np.float64)
     spec.stat.extent = math.hypot(half_x, half_y)
     spec.visual.global_.elevation = -60
     spec.visual.global_.azimuth = 90
-    spec.visual.map.znear = 0.001
-    spec.visual.map.zfar = 20.0
+    # znear/zfar are in units of stat.extent (kilometres here), not metres.
+    # Keep the near plane at ~5 cm so a 1.3 m robot isn't clipped when zoomed in.
+    spec.visual.map.znear = 0.05 / spec.stat.extent
+    spec.visual.map.zfar = 3.0
 
+    if add_person:
+        # g1_mjx.xml uses only sphere/capsule/box colliders. MJX can't collide a
+        # heightfield with cylinders (g1.xml's shoulders), and mesh colliders are slow.
+        xml = open(os.path.join("robot", "g1_mjx.xml"), "r", encoding="utf-8").read()
+        xml = xml.replace('<compiler angle="radian" meshdir="assets"/>', '<compiler angle="radian" meshdir="./robot/assets"/>') # Make sure assts are
+        utils.import_mujoco_xml_to_spec(spec, xml, frame_name="person_frame")
+
+        # Solver settings matching g1_mjx.xml (attaching a body doesn't copy <option>).
+        spec.option.timestep = 0.004
+        spec.option.iterations = 5
+        spec.option.ls_iterations = 8
+        spec.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
+        spec.option.disableflags |= mujoco.mjtDisableBit.mjDSBL_EULERDAMP
+
+        # g1_mjx.xml disables all automatic contacts (contype=conaffinity=0), so
+        # every contact must be an explicit pair, as in robot/scene_mjx.xml.
+        for side in ("left", "right"):
+            for i in (1, 2, 3):
+                spec.add_pair(name=f"{side}_foot{i}_terrain", geomname1=f"{side}_foot{i}_collision",
+                              geomname2="terrain_geom", condim=3, solref=[0.008, 1],
+                              friction=[1, 1, 0.005, 0.0001, 0.0001])
+            for part in ("hand", "shoulder_yaw", "elbow_yaw", "wrist", "hip", "thigh", "shin"):
+                spec.add_pair(name=f"{side}_{part}_terrain", geomname1=f"{side}_{part}_collision",
+                              geomname2="terrain_geom", condim=3)
+        for part in ("pelvis", "torso", "head"):
+            spec.add_pair(name=f"{part}_terrain", geomname1=f"{part}_collision",
+                          geomname2="terrain_geom", condim=3)
+
+        # Self-collision pairs from robot/scene_mjx.xml.
+        self_pairs = [
+            ("left_foot_box", "right_foot_box"),
+            ("left_foot_box", "right_shin"), ("right_foot_box", "left_shin"),
+            ("left_foot_box", "right_linkage_brace"), ("right_foot_box", "left_linkage_brace"),
+            ("left_hand", "left_hip"), ("right_hand", "right_hip"),
+            ("left_hand", "left_thigh"), ("right_hand", "right_thigh"),
+            ("left_shin", "right_shin"),
+            ("torso", "left_shoulder_yaw"), ("torso", "right_shoulder_yaw"),
+            ("torso", "left_elbow_yaw"), ("torso", "right_elbow_yaw"),
+            ("torso", "left_wrist"), ("torso", "right_wrist"),
+            ("torso", "left_hand"), ("torso", "right_hand"),
+            ("left_thigh", "right_thigh"),
+            ("left_shin", "right_thigh"), ("right_shin", "left_thigh"),
+            ("left_shin", "right_hip"), ("right_shin", "left_hip"),
+            ("left_hip", "right_thigh"), ("right_hip", "left_thigh"),
+            ("left_hand", "right_hand"),
+        ]
+        for a, b in self_pairs:
+            spec.add_pair(name=f"{a}_{b}", geomname1=f"{a}_collision",
+                          geomname2=f"{b}_collision", condim=1)
+
+        # Spawn just above the actual ground at (0, 0) instead of above the
+        # highest peak, so the robot doesn't free-fall hundreds of metres.
+        ground_z = hf_lo + _hfieldHeight(hfield01, hf_relief, half_x, half_y, 0.0, 0.0)
+        pelvis = spec.body("pelvis")
+        pelvis.pos = np.array([0, 0, ground_z + 0.8], dtype=np.float64)  # g1 pelvis stands ~0.79 m high
+
+        # Chase camera; select it in the viewer's Rendering > Camera list (or press ']').
+        pelvis.add_camera(
+            name="follow",
+            mode=mujoco.mjtCamLight.mjCAMLIGHT_TRACKCOM,
+            pos=[-10, 0, 3],
+            xyaxes=[0, -1, 0, 0.3, 0, 1],
+            quat=[-1, 0, 0, -1]
+        )
     model = spec.compile()
     with open(os.path.join("data", name + ".xml"), "w", encoding="utf-8") as f:
         f.write(spec.to_xml())
 
-    return model
+    return (model, spec)
