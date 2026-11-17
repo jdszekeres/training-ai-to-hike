@@ -8,9 +8,10 @@ from scipy import ndimage
 from PIL import Image, ImageDraw
 import json
 
-# Approximate metres per degree of latitude/longitude (WGS84).
-M_PER_DEG_LAT = 110574.0
-M_PER_DEG_LON_EQUATOR = 111320.0
+# Approximate metres per degree of latitude/longitude (WGS84); shared with
+# utils.CoordinateSystem so world coordinates line up with the heightfield.
+M_PER_DEG_LAT = utils.M_PER_DEG_LAT
+M_PER_DEG_LON_EQUATOR = utils.M_PER_DEG_LON_EQUATOR
 
 # Longest side (in pixels) of the generated terrain texture. The DEM itself is
 # coarse (~90 m/pixel for SRTMGL3), so the texture is upsampled so trails can be
@@ -98,36 +99,6 @@ def getTrails(lat1, lon1, lat2, lon2, cache_file=None):
         with open(cache_file, "w", encoding="utf-8") as f:
             json.dump(json_response, f)
     return json_response
-
-def coordinate_to_pixel(lat, lon, terrain_file):
-    """
-    Converts geographic coordinates (latitude, longitude) to pixel coordinates in the terrain image.
-
-    Parameters:
-    lat: Latitude of the point.
-    lon: Longitude of the point.
-    terrain_file: Path to the terrain GeoTIFF file.
-
-    Returns:
-    A tuple (col, row) representing the pixel coordinates in the terrain image.
-    """
-    with rasterio.open(terrain_file) as dataset:
-        # Get the affine transformation for the dataset
-        transform = dataset.transform
-        # Use the inverse of the transform to convert geographic coordinates to pixel coordinates
-        inv_transform = ~transform
-        col, row = inv_transform * (lon, lat)
-        return int(col), int(row)
-
-def pixel_to_world_coordinate(row, col, terrain_file):
-    """
-    Convert pixel coordiantes (row, col) to coordinates in the mujoco world frame (x, y)."""
-    
-    with rasterio.open(terrain_file) as dataset:
-        transform = dataset.transform
-        # Use the transform to convert pixel coordinates to geographic coordinates
-        lon, lat = transform * (col + 0.5, row + 0.5)  # +0.5 to get the center of the pixel
-        return lat, lon
     
 
 def _trailPolylines(trails_data, inv_transform):
@@ -140,6 +111,7 @@ def _trailPolylines(trails_data, inv_transform):
         for point in element['geometry']:
             # ~transform maps (lon, lat) -> (col, row) of pixel *corners*;
             # subtract 0.5 so integer values land on pixel centres.
+
             col, row = inv_transform * (point['lon'], point['lat'])
             pts.append((col - 0.5, row - 0.5))
         if len(pts) >= 2:
@@ -200,7 +172,9 @@ def _fractalRoughness(shape, cell_m, rng):
     return noise
 
 
-def buildWorldModel(lat1, lon1, lat2, lon2, name, add_person=True):
+
+
+def buildWorldModel(lat1, lon1, lat2, lon2, name, add_person=True, player_pos: utils.CoordinateSystem | None = None):
     """
     Builds a world representation from the elevation data file.
 
@@ -260,7 +234,7 @@ def buildWorldModel(lat1, lon1, lat2, lon2, name, add_person=True):
     padded = np.pad(elevation_m, 1, mode="edge")
     blurred = sum(padded[1 + dy:1 + dy + nrow, 1 + dx:1 + dx + ncol]
                   for dy in (-1, 0, 1) for dx in (-1, 0, 1)) / 9.0
-    elevation_m[trail_mask] = blurred[trail_mask]
+    elevation_m[trail_mask] = blurred[trail_mask] #type: ignore
 
     # --- Fine heightfield with roughness -------------------------------------
     hf_cell_m = max(HFIELD_TARGET_CELL_M, math.sqrt(4 * half_x * half_y / HFIELD_MAX_CELLS))
@@ -269,8 +243,8 @@ def buildWorldModel(lat1, lon1, lat2, lon2, name, add_person=True):
     # Bicubic resample; zoom() aligns the first/last samples with the DEM's
     # first/last pixel centres, so the extent (half_x, half_y) is unchanged.
     fine_m = ndimage.zoom(elevation_m - minimum, (hf_nrow / nrow, hf_ncol / ncol),
-                          order=3, mode="nearest", grid_mode=False).astype(np.float32)
-    hf_nrow, hf_ncol = fine_m.shape
+                          order=3, mode="nearest", grid_mode=False).astype(np.float32) #type: ignore
+    hf_nrow, hf_ncol = fine_m.shape #type: ignore
 
     # Trails at their real width, feathered, so they stay smoother than open ground.
     fine_trail_img = Image.new("L", (hf_ncol, hf_nrow), 0)
@@ -303,8 +277,8 @@ def buildWorldModel(lat1, lon1, lat2, lon2, name, add_person=True):
     scale = max(1, TEXTURE_MAX_SIZE // max(ncol, nrow))
     tex_w, tex_h = (ncol - 1) * scale + 1, (nrow - 1) * scale + 1
 
-    hi_elev = np.array(Image.fromarray(elevation_m, mode="F").resize((tex_w, tex_h), Image.BICUBIC))
-    hi_valid = np.array(Image.fromarray(valid.astype(np.uint8) * 255).resize((tex_w, tex_h), Image.NEAREST)) > 0
+    hi_elev = np.array(Image.fromarray(elevation_m, mode="F").resize((tex_w, tex_h), Image.BICUBIC)) # type: ignore
+    hi_valid = np.array(Image.fromarray(valid.astype(np.uint8) * 255).resize((tex_w, tex_h), Image.NEAREST)) > 0 # type: ignore
 
     rgb = _colorize(np.clip((hi_elev - minimum) / relief, 0.0, 1.0))
     shade = _hillshade(hi_elev, dx_m / scale, dy_m / scale)
@@ -439,9 +413,17 @@ def buildWorldModel(lat1, lon1, lat2, lon2, name, add_person=True):
 
         # Spawn just above the actual ground at (0, 0) instead of above the
         # highest peak, so the robot doesn't free-fall hundreds of metres.
-        ground_z = hf_lo + _hfieldHeight(hfield01, hf_relief, half_x, half_y, 0.0, 0.0)
+
+        if player_pos is not None:
+            player_x, player_y = player_pos.to_world(os.path.join("data", name + ".tif"))
+        else:
+            player_x, player_y = 0.0, 0.0
+        print(f"Spawning player at world (x, y) = ({player_x:.2f}, {player_y:.2f})")
+        ground_z = hf_lo + _hfieldHeight(hfield01, hf_relief, half_x, half_y, player_x, player_y)
         pelvis = spec.body("pelvis")
-        pelvis.pos = np.array([0, 0, ground_z + 0.8], dtype=np.float64)  # g1 pelvis stands ~0.79 m high
+
+        
+        pelvis.pos = np.array([player_x, player_y, ground_z + 0.8], dtype=np.float64)  # g1 pelvis stands ~0.79 m high
 
         # Chase camera; select it in the viewer's Rendering > Camera list (or press ']').
         pelvis.add_camera(

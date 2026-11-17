@@ -1,13 +1,14 @@
 import os
 import time
+import sys
 
 import dotenv
 import mujoco
-import mujoco.viewer
 import numpy as np
 import terrain
 import environment
 import ppo
+import utils
 
 dotenv.load_dotenv()
 if not os.path.exists("data"):
@@ -26,12 +27,20 @@ if __name__ == "__main__":
     NAME="WHITNEY"
     SAVE_PATH = os.path.join("checkpoints", "ppo_hike")
 
-    (model, spec) = terrain.buildWorldModel(BOUNDING_BOX[1], BOUNDING_BOX[0], BOUNDING_BOX[3], BOUNDING_BOX[2], NAME)
 
-    goal_col, goal_row = terrain.coordinate_to_pixel(GOAL[0], GOAL[1], os.path.join("data", NAME + ".tif"))
-    goal_world_x, goal_world_y = terrain.pixel_to_world_coordinate(goal_row, goal_col, os.path.join("data", NAME + ".tif"))
-    goal_height = environment.get_terrain_height(model, goal_world_x, goal_world_y)
-    goal_position = np.array([goal_world_x, goal_world_y, goal_height])
+    start_coordinates = utils.CoordinateSystem.from_lat_lon(36.585950, -118.241942) # Whitney Portal
+    goal_coordinates = utils.CoordinateSystem.from_lat_lon(GOAL[0], GOAL[1])
+
+    (model, spec) = terrain.buildWorldModel(BOUNDING_BOX[1], BOUNDING_BOX[0], BOUNDING_BOX[3], BOUNDING_BOX[2], NAME, player_pos=start_coordinates)
+
+
+    
+    terrain_file = os.path.join("data", NAME + ".tif")
+
+    start_position = start_coordinates.to_world(terrain_file)
+    goal_height = environment.get_terrain_height(model, goal_coordinates, terrain_file)
+    goal_position = np.array([*goal_coordinates.to_world(terrain_file), goal_height])
+    print(f"Start (world): {start_position}, goal (world): {goal_position}")
 
     # Stable-Baselines3 PPO on CPU MuJoCo. preview=True opens a viewer on the
     # first worker so you can watch a robot while it trains (Ctrl+C stops
@@ -41,26 +50,37 @@ if __name__ == "__main__":
         goal_position,
         total_timesteps=5_000_000,
         episode_length=1000,
-        preview=True,
+        preview="--preview" in sys.argv,
         save_path=SAVE_PATH,
         learning_rate=3e-4,
         ent_coef=0.01,
         gamma=0.99,
+        start_position=start_position,  # forwarded to every TerrainEnv
     )
 
-    # Watch the trained policy.
-    policy = ppo.load_policy(SAVE_PATH)
-    env = environment.TerrainEnv(model, goal_position=goal_position)
-    obs, _ = env.reset(seed=0)
-    with mujoco.viewer.launch_passive(env.model, env.data) as v:
-        v.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
-        v.cam.trackbodyid = model.body("pelvis").id
-        v.cam.distance = 4
-        v.cam.elevation = -20
-        while v.is_running():
-            t0 = time.perf_counter()
-            obs, _, terminated, truncated, _ = env.step(policy(obs))
-            if terminated or truncated:
-                obs, _ = env.reset()
-            v.sync()
-            time.sleep(max(0.0, env.dt - (time.perf_counter() - t0)))  # real time
+    if "--preview" in sys.argv:
+        # Watch the trained policy. Needs a display, so it is skipped on
+        # headless machines such as Google Colab (run without --preview there).
+        import mujoco.viewer
+
+        policy = ppo.load_policy(SAVE_PATH)
+        env = environment.TerrainEnv(model, start_position=start_position, goal_position=goal_position)
+        obs, _ = env.reset(seed=0)
+
+        # Launch a MuJoCo viewer to watch the robot with the trained policy.
+        with mujoco.viewer.launch_passive(env.model, env.data) as v:
+            v.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+            v.cam.trackbodyid = model.body("pelvis").id
+            v.cam.distance = 4
+            v.cam.elevation = -20
+
+            
+            while v.is_running():
+                t0 = time.perf_counter()
+                obs, _, terminated, truncated, _ = env.step(policy(obs))
+                if terminated or truncated:
+                    obs, _ = env.reset()
+
+                
+                v.sync()
+                time.sleep(max(0.0, env.dt - (time.perf_counter() - t0)))  # real time

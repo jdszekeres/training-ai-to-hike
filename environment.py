@@ -9,8 +9,10 @@ import time
 
 import gymnasium as gym
 import mujoco
-import mujoco.viewer
+from mujoco._structs import MjModel
 import numpy as np
+
+from utils import CoordinateSystem
 
 # Joint angles of the "home" keyframe in robot/scene_mjx.xml (qpos[7:], which
 # also equals ctrl since every actuator is a position servo on one joint).
@@ -54,9 +56,12 @@ class HField:
     return float(self.origin[2] + h * self.relief)
 
 
-def get_terrain_height(model, x, y):
+
+def get_terrain_height(model: MjModel, coordinates: CoordinateSystem, terrain_file: str) -> float:
   """Terrain height at world (x, y) for a compiled MjModel (0 if it has no heightfield)."""
-  return HField(model).height(x, y) if model.nhfield else 0.0
+  return HField(model).height(
+    *coordinates.to_world(terrain_file)
+  ) if model.nhfield else 0.0
 
 
 class TerrainEnv(gym.Env):
@@ -73,10 +78,14 @@ class TerrainEnv(gym.Env):
 
   metadata = {"render_modes": ["human"], "render_fps": 30}
 
-  def __init__(self, model, goal_position=None, step_dt=0.02, action_scale=0.5,
+  def __init__(self, model, start_position=(0,0), goal_position=None, step_dt=0.02, action_scale=0.5,
                reset_noise=0.05, render_mode=None, preview=False):
     # MjModel is picklable, so this env can be built inside SubprocVecEnv workers.
     self.model = model
+
+    self.start_position = np.asarray(start_position, dtype=np.float64)
+
+
     self.data = mujoco.MjData(model)
     self.goal_position = np.asarray(
         goal_position if goal_position is not None else [0.0, 0.0, 0.0], dtype=np.float64)
@@ -116,6 +125,9 @@ class TerrainEnv(gym.Env):
   # --- MDP ----------------------------------------------------------------------
   def _get_observation(self):
     d = self.data
+
+    sensors =self.get_sensors()  # update d.sensordata
+
     return np.concatenate([
         d.qpos,                 # positions
         d.qvel,                 # velocities
@@ -123,21 +135,38 @@ class TerrainEnv(gym.Env):
         d.xpos.ravel(),         # body positions
         [self.get_terrain_height(d.qpos[0], d.qpos[1])],  # height at robot's position
         self.goal_position - d.qpos[:3],                   # pelvis -> goal vector
+
+        sensors["imu-torso-angular-velocity"].flatten(),
+        sensors["imu-torso-linear-acceleration"].flatten(),
+        sensors["imu-pelvis-angular-velocity"].flatten(),
+        sensors["imu-pelvis-linear-acceleration"].flatten(),
     ]).astype(np.float32)
+
+  def get_sensors(self):
+    d = self.data
+    
+    return {
+        "imu-torso-angular-velocity": d.sensordata[mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, "imu-torso-angular-velocity")],
+        "imu-torso-linear-acceleration": d.sensordata[mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, "imu-torso-linear-acceleration")],
+        "imu-pelvis-angular-velocity": d.sensordata[mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, "imu-pelvis-angular-velocity")],
+        "imu-pelvis-linear-acceleration": d.sensordata[mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, "imu-pelvis-linear-acceleration")]
+    }
 
   def _get_reward(self, action):
     # Distance to the goal, energy efficiency, and stability.
     d = self.data
-    distance_reward = -np.linalg.norm(d.qpos[:3] - self.goal_position)
+    movement_reward = -(np.linalg.norm(d.qvel[0:3]) - 4) ** 2 # Encourage moving at a speed of 4 m/s, penalize too slow or too fast
+    stability_reward = 0.0 if np.linalg.norm(d.qvel[:3]) > 10.0 or np.linalg.norm(d.qpos[2]) < 0.1 else 1.0 # Punish falling over, encourage stability 
+    distance_reward = -np.linalg.norm(d.qpos[0:3] - self.goal_position)
     energy_reward = -np.sum(np.square(action))      # Penalize large actions
-    stability_reward = -np.sum(np.square(d.qvel))   # Penalize high velocities
 
     #If fall, end the episode and give a large negative reward
     if d.qpos[2] < 0.5:  # If the pelvis height is below 0.5 meters, consider it a fall
-        return -100.0  # Large negative reward for falling
+        print("Robot has fallen! Ending episode.")
+        return -100_000.0  # Large negative reward for falling
     
     
-    return float(distance_reward + 0.1 * energy_reward + 0.1 * stability_reward)
+    return float(distance_reward + 0.1 * energy_reward + 0.1 * movement_reward * stability_reward)
 
   def _get_done(self):
     return bool(np.linalg.norm(self.data.qpos[:3] - self.goal_position) < 0.1) or self.data.qpos[2] < 0.5  # Terminate if the robot is close to the goal or has fallen
@@ -145,6 +174,7 @@ class TerrainEnv(gym.Env):
   def _reset_sim(self):
     mujoco.mj_resetData(self.model, self.data)
     qpos = self._init_qpos.copy()
+    qpos[:3] = [*self.start_position, self.get_terrain_height(*self.start_position) + 0.8]  # Start 0.5m above the terrain
     qpos[7:] += self.np_random.uniform(-self.reset_noise, self.reset_noise, self.model.nq - 7)
     self.data.qpos[:] = qpos
     self.data.qvel[:] = 0.0
@@ -188,6 +218,8 @@ class TerrainEnv(gym.Env):
       return
     self._last_sync = now
     if self._viewer is None:
+      # Imported lazily so headless machines (e.g. Google Colab) never need a display.
+      import mujoco.viewer
       self._viewer = mujoco.viewer.launch_passive(
           self.model, self.data, show_left_ui=False, show_right_ui=False)
       self._viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
