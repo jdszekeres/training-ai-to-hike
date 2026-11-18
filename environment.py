@@ -131,7 +131,6 @@ class TerrainEnv(gym.Env):
     return np.concatenate([
         d.qpos,                 # positions
         d.qvel,                 # velocities
-        d.act,                  # actuator states
         d.xpos.ravel(),         # body positions
         [self.get_terrain_height(d.qpos[0], d.qpos[1])],  # height at robot's position
         self.goal_position - d.qpos[:3],                   # pelvis -> goal vector
@@ -140,36 +139,47 @@ class TerrainEnv(gym.Env):
         sensors["imu-torso-linear-acceleration"].flatten(),
         sensors["imu-pelvis-angular-velocity"].flatten(),
         sensors["imu-pelvis-linear-acceleration"].flatten(),
+
+        
     ]).astype(np.float32)
 
+
+  def _get_sensor_vals(self, sensor_name):
+    sid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, sensor_name)
+    adr, dim = self.model.sensor_adr[sid], self.model.sensor_dim[sid]
+    return self.data.sensordata[adr:adr + dim]
   def get_sensors(self):
     d = self.data
     
     return {
-        "imu-torso-angular-velocity": d.sensordata[mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, "imu-torso-angular-velocity")],
-        "imu-torso-linear-acceleration": d.sensordata[mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, "imu-torso-linear-acceleration")],
-        "imu-pelvis-angular-velocity": d.sensordata[mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, "imu-pelvis-angular-velocity")],
-        "imu-pelvis-linear-acceleration": d.sensordata[mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, "imu-pelvis-linear-acceleration")]
+        "imu-torso-angular-velocity": self._get_sensor_vals("imu-torso-angular-velocity"),
+        "imu-torso-linear-acceleration": self._get_sensor_vals("imu-torso-linear-acceleration"),
+        "imu-pelvis-angular-velocity": self._get_sensor_vals("imu-pelvis-angular-velocity"),
+        "imu-pelvis-linear-acceleration": self._get_sensor_vals("imu-pelvis-linear-acceleration")
     }
 
   def _get_reward(self, action):
     # Distance to the goal, energy efficiency, and stability.
     d = self.data
-    movement_reward = -(np.linalg.norm(d.qvel[0:3]) - 4) ** 2 # Encourage moving at a speed of 4 m/s, penalize too slow or too fast
-    stability_reward = 0.0 if np.linalg.norm(d.qvel[:3]) > 10.0 or np.linalg.norm(d.qpos[2]) < 0.1 else 1.0 # Punish falling over, encourage stability 
-    distance_reward = -np.linalg.norm(d.qpos[0:3] - self.goal_position)
+    movement_reward = -(np.linalg.norm(d.qvel[0:3]) - 2) ** 2 # Encourage moving at a speed of 4 m/s, penalize too slow or too fast
+    stability_reward = 0.0 if np.linalg.norm(d.qvel[:3]) > 10.0 or np.linalg.norm(d.qpos[2] - self.get_terrain_height(d.qpos[0], d.qpos[1])) < 0.1 else 1.0 # Punish falling over, encourage stability 
+    distance_reward = -np.sqrt(np.linalg.norm(d.qpos[0:3] - self.goal_position) * 0.01)
     energy_reward = -np.sum(np.square(action))      # Penalize large actions
 
+    goal_vector = self.goal_position - d.qpos[:3] / np.linalg.norm(self.goal_position - d.qpos[:3])  # normalized vector to goal
+    direction_movement_vector = d.qvel[:3] / np.linalg.norm(d.qvel[:3])  # direction of velocity
+
+    direction_alignment_reward = np.dot(goal_vector, direction_movement_vector)  # Reward for moving in the direction of the goal    
+
     #If fall, end the episode and give a large negative reward
-    if d.qpos[2] < 0.5:  # If the pelvis height is below 0.5 meters, consider it a fall
-        print("Robot has fallen! Ending episode.")
+    if d.qpos[2] - self.get_terrain_height(d.qpos[0], d.qpos[1]) < 0.5:  # If the pelvis height is below 0.5 meters, consider it a fall or the torso is not upright
         return -100_000.0  # Large negative reward for falling
     
     
-    return float(distance_reward + 0.1 * energy_reward + 0.1 * movement_reward * stability_reward)
+    return float(distance_reward + 0.1 * energy_reward + 0.1 * movement_reward * stability_reward + 0.1 * direction_alignment_reward)
 
   def _get_done(self):
-    return bool(np.linalg.norm(self.data.qpos[:3] - self.goal_position) < 0.1) or self.data.qpos[2] < 0.5  # Terminate if the robot is close to the goal or has fallen
+    return bool(np.linalg.norm(self.data.qpos[:3] - self.goal_position) < 0.1) or self.data.qpos[2] - self.get_terrain_height(self.data.qpos[0], self.data.qpos[1]) < 0.5  # Terminate if the robot is close to the goal or has fallen
 
   def _reset_sim(self):
     mujoco.mj_resetData(self.model, self.data)

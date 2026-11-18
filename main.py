@@ -28,7 +28,7 @@ if __name__ == "__main__":
     SAVE_PATH = os.path.join("checkpoints", "ppo_hike")
 
 
-    start_coordinates = utils.CoordinateSystem.from_lat_lon(36.585950, -118.241942) # Whitney Portal
+    start_coordinates = utils.CoordinateSystem.from_lat_lon(36.586889, -118.240045) # Whitney Portal
     goal_coordinates = utils.CoordinateSystem.from_lat_lon(GOAL[0], GOAL[1])
 
     (model, spec) = terrain.buildWorldModel(BOUNDING_BOX[1], BOUNDING_BOX[0], BOUNDING_BOX[3], BOUNDING_BOX[2], NAME, player_pos=start_coordinates)
@@ -48,8 +48,8 @@ if __name__ == "__main__":
     ppo.train(
         model,
         goal_position,
-        total_timesteps=5_000_000,
-        episode_length=1000,
+        total_timesteps=500_000_000,
+        episode_length=16 * 3600 * 100,  # 16 hours at 100 Hz
         preview="--preview" in sys.argv,
         save_path=SAVE_PATH,
         learning_rate=3e-4,
@@ -59,8 +59,6 @@ if __name__ == "__main__":
     )
 
     if "--preview" in sys.argv:
-        # Watch the trained policy. Needs a display, so it is skipped on
-        # headless machines such as Google Colab (run without --preview there).
         import mujoco.viewer
 
         policy = ppo.load_policy(SAVE_PATH)
