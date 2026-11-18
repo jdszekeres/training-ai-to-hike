@@ -65,7 +65,7 @@ def train(model, goal_position, total_timesteps=5_000_000, n_envs=None, episode_
       gamma=gamma, gae_lambda=gae_lambda, clip_range=clip_range, max_grad_norm=max_grad_norm,
       policy_kwargs=dict(net_arch=dict(pi=list(hidden_sizes), vf=list(hidden_sizes)),
                          activation_fn=torch.nn.SiLU, log_std_init=-0.5),
-      device="gpu",  # small MLPs train faster on CPU than shuttling batches to a GPU
+      device="cuda",  # small MLPs train faster on CPU than shuttling batches to a GPU
       seed=seed, verbose=1,
   )
 
