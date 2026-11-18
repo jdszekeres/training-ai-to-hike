@@ -55,6 +55,7 @@ if __name__ == "__main__":
         learning_rate=3e-4,
         ent_coef=0.01,
         gamma=0.99,
+        checkpoint_every=50_000_000,
         start_position=start_position,  # forwarded to every TerrainEnv
     )
 

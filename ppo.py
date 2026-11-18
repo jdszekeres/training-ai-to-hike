@@ -41,7 +41,7 @@ def make_vec_env(model, goal_position, n_envs, episode_length=1000, preview=Fals
 
 
 def train(model, goal_position, total_timesteps=5_000_000, n_envs=None, episode_length=1000,
-          preview=False, save_path=os.path.join("checkpoints", "ppo_hike"), checkpoint_every=500_000,
+          preview=False, save_path=os.path.join("checkpoints", "ppo_hike"), checkpoint_every=5_000_000 // 10,
           n_steps=256, batch_size=1024, n_epochs=4, learning_rate=3e-4, ent_coef=0.01,
           gamma=0.99, gae_lambda=0.95, clip_range=0.2, max_grad_norm=1.0,
           hidden_sizes=(256, 256, 128), seed=0, **env_kwargs):
