@@ -5,6 +5,7 @@ CPU MuJoCo so it can be stepped by Stable-Baselines3.
 The observation, reward and termination match the previous MJX TerrainEnv
 (kept in legacy/environment_mjx.py).
 """
+import math
 import time
 
 import gymnasium as gym
@@ -85,6 +86,7 @@ class TerrainEnv(gym.Env):
 
     self.start_position = np.asarray(start_position, dtype=np.float64)
 
+    self.prev_position = tuple(start_position)
 
     self.data = mujoco.MjData(model)
     self.goal_position = np.asarray(
@@ -140,7 +142,7 @@ class TerrainEnv(gym.Env):
         sensors["imu-pelvis-angular-velocity"].flatten(),
         sensors["imu-pelvis-linear-acceleration"].flatten(),
 
-        
+        self.prev_position - d.qpos[:2],  # previous position -> current position vector
     ]).astype(np.float32)
 
 
@@ -158,25 +160,76 @@ class TerrainEnv(gym.Env):
         "imu-pelvis-linear-acceleration": self._get_sensor_vals("imu-pelvis-linear-acceleration")
     }
 
+
+  def _RBF_kernel(self, x, x_prime, sigma=1.0):
+    """Radial Basis Function (RBF) kernel."""
+    return np.exp(-np.linalg.norm(x - x_prime) ** 2 / (2 * sigma ** 2))
+
+  def _calculate_terrain_gradient(self, x, y, delta=0.01):
+    """Calculate the gradient of the terrain at a given (x, y) position."""
+    h = self.get_terrain_height(x, y)
+    h_x_plus = self.get_terrain_height(x + delta, y)
+    h_x_minus = self.get_terrain_height(x - delta, y)
+    h_y_plus = self.get_terrain_height(x, y + delta)
+    h_y_minus = self.get_terrain_height(x, y - delta)
+
+    dh_dx = (h_x_plus - h_x_minus) / (2 * delta)
+    dh_dy = (h_y_plus - h_y_minus) / (2 * delta)
+
+    return np.array([dh_dx, dh_dy])
+
   def _get_reward(self, action):
     # Distance to the goal, energy efficiency, and stability.
     d = self.data
-    movement_reward = -(np.linalg.norm(d.qvel[0:3]) - 2) ** 2 # Encourage moving at a speed of 4 m/s, penalize too slow or too fast
-    stability_reward = 0.0 if np.linalg.norm(d.qvel[:3]) > 10.0 or np.linalg.norm(d.qpos[2] - self.get_terrain_height(d.qpos[0], d.qpos[1])) < 0.1 else 1.0 # Punish falling over, encourage stability 
-    distance_reward = -np.sqrt(np.linalg.norm(d.qpos[0:3] - self.goal_position) * 0.01)
-    energy_reward = -np.sum(np.square(action))      # Penalize large actions
 
-    goal_vector = self.goal_position - d.qpos[:3] / np.linalg.norm(self.goal_position - d.qpos[:3])  # normalized vector to goal
-    direction_movement_vector = d.qvel[:3] / np.linalg.norm(d.qvel[:3])  # direction of velocity
+    h = d.qpos[2] - self.get_terrain_height(d.qpos[0], d.qpos[1])
+    sqrt2 = math.sqrt(2)
+    is_fallen = h < 0.3  # If the pelvis height is below 0.3 meters, consider it a fall or the torso is not upright
 
-    direction_alignment_reward = np.dot(goal_vector, direction_movement_vector)  # Reward for moving in the direction of the goal    
+    alive_bonus = 1 if not is_fallen else 0
+    upright_bonus = 0 # TODO: Add upright bonus based on torso orientation
+    pelvis_height_score = self._RBF_kernel(h, 0.75, 0.25 / sqrt2)  # Encourage pelvis height around 0.75m
 
-    #If fall, end the episode and give a large negative reward
-    if d.qpos[2] - self.get_terrain_height(d.qpos[0], d.qpos[1]) < 0.5:  # If the pelvis height is below 0.5 meters, consider it a fall or the torso is not upright
-        return -100_000.0  # Large negative reward for falling
+
+
+    angular_velocity_penalty = -np.linalg.norm(d.qvel[3:5]) ** 2  # Penalize high angular velocity
+    vertical_velocity_penalty = -np.linalg.norm(d.qvel[2]) ** 2  # Penalize high vertical velocity
+
+    action_efficiency_penalty = -np.sum(np.square(action))  # Penalize large actions
     
+    power_penalty = -np.sum(np.abs(d.actuator_force * d.actuator_velocity))  # Penalize high power usage
     
-    return float(distance_reward + 0.1 * energy_reward + 0.1 * movement_reward * stability_reward + 0.1 * direction_alignment_reward)
+    torque_penalty = -np.sum(np.square(d.actuator_force))  # Penalize high actuator forces
+
+    arm_penalty = -np.sum(np.square(d.qpos[19:26]))  # Penalize large arm movements
+
+    terrain_gradient = self._calculate_terrain_gradient(d.qpos[0], d.qpos[1])
+    slope = np.linalg.norm(terrain_gradient)
+    slope_penalty = -slope
+
+    expected_speed = 1000 * (1/60) *  6 * math.exp(-3.5 * abs(slope + 0.05)) # Tobler's hiking function in m/s
+
+    speed_score = self._RBF_kernel(np.linalg.norm(d.qvel[0:3]), expected_speed, 1.5 / sqrt2)  # Encourage speed close to expected speed
+    
+    progress_bonus = np.linalg.norm(self.prev_position - d.qpos[:2]) / self.dt  # Reward for moving forward towards the goal
+
+    self.prev_position = d.qpos[:2].copy()  # Update previous position for the next step
+
+    
+    return (
+        1.0 * progress_bonus +  # Encourage forward progress
+        0.5 * upright_bonus +  # Encourage upright posture
+        0.2 * pelvis_height_score +  # Encourage pelvis height around 0.75m
+        0.5 * speed_score +  # Encourage speed close to expected speed
+        0.5 * alive_bonus +  # Penalize falling
+        0.1 * angular_velocity_penalty +  # Penalize high angular velocity
+        0.1 * vertical_velocity_penalty +  # Penalize high vertical velocity
+        0.01 * action_efficiency_penalty +  # Penalize large actions
+        0.0002 * power_penalty +  # Penalize high power usage
+        0.0001 * torque_penalty +  # Penalize high actuator forces
+        0.05 * arm_penalty +  # Penalize large arm movements
+        0.1 * slope_penalty   # Penalize steep slopes
+    )
 
   def _get_done(self):
     return bool(np.linalg.norm(self.data.qpos[:3] - self.goal_position) < 0.1) or self.data.qpos[2] - self.get_terrain_height(self.data.qpos[0], self.data.qpos[1]) < 0.5  # Terminate if the robot is close to the goal or has fallen
